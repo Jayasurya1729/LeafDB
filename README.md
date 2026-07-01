@@ -1,6 +1,6 @@
 # LeafDB
 
-A custom relational database engine built from scratch in **C++17**, featuring a hand-written SQL parser, B+ tree storage engine, write-ahead logging, snapshot-based transactions, secondary indexing, LLM integration, and a live web dashboard.
+A custom relational database engine built from scratch in **C++**, featuring a hand-written SQL parser, B+ tree storage engine, write-ahead logging, snapshot-based transactions, secondary indexing, LLM integration, and a live web dashboard.
 
 ---
 
