@@ -1,0 +1,15 @@
+Updated executeInsert to apply directly to kvStore during transactions while still logging:
+
+// If in transaction, insert immediately but also log for durability
+if (storageManager->isInTransaction())
+{
+    // Apply to kvStore immediately for in-memory consistency
+    insertRow(storageManager->getKVStore(), table, rec, storageManager->getIndex());
+    // Also log to storage manager for potential durability on commit
+    storageManager->insertRecord(1, statement.tableName, rec);
+}
+else
+{
+    // Regular insert
+    insertRow(storageManager->getKVStore(), table, rec, storageManager->getIndex());
+}

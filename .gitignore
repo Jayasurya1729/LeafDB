@@ -1,0 +1,5 @@
+build/
+coredb_data/
+*.o
+*.a
+coredb
