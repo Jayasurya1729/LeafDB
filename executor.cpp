@@ -37,6 +37,13 @@ namespace
         return v;
     }
 
+    std::string makeLockKey(const Value &value)
+    {
+        if (value.type == TYPE_INT)
+            return std::to_string(value.i);
+        return value.s;
+    }
+
     QueryResult makeError(const std::string &message)
     {
         QueryResult result;
@@ -511,6 +518,13 @@ QueryResult Executor::executeInsert(const SqlStatement &statement)
     }
 
     Record rec = buildRecordFromValues(tm, values);
+    int pkIndex = tm.primaryKeyIndex >= 0 ? tm.primaryKeyIndex : 0;
+    std::string rowKey;
+    if (pkIndex >= 0 && pkIndex < static_cast<int>(values.size()))
+        rowKey = makeLockKey(values[pkIndex]);
+
+    storageManager->acquireWriteLock(statement.tableName, rowKey);
+
     int tableId = storageManager->getTableId(statement.tableName);
     storageManager->insertRecord(tableId, statement.tableName, rec);
 
@@ -662,6 +676,19 @@ QueryResult Executor::executeSelect(const SqlStatement &statement)
     QueryResult result;
     result.indexUsed = false;
 
+    std::string rowKey;
+    if (statement.where.enabled)
+    {
+        Value pkValue;
+        if (tryGetPrimaryKeyValue(tm, statement.where, pkValue))
+            rowKey = makeLockKey(pkValue);
+    }
+
+    if (!rowKey.empty())
+        storageManager->acquireReadLock(statement.tableName, rowKey);
+    else
+        storageManager->acquireReadLock(statement.tableName);
+
     // ----------------------------------------------------------------
     // JOIN path: nested-loop inner join, then project from combined row
     // ----------------------------------------------------------------
@@ -669,6 +696,8 @@ QueryResult Executor::executeSelect(const SqlStatement &statement)
     {
         if (!storageManager->getCatalog().tableExists(statement.joinTable))
             return makeError("Table not found: " + statement.joinTable);
+
+        storageManager->acquireReadLock(statement.joinTable);
 
         TableMetadata joinTm  = storageManager->getCatalog().getTable(statement.joinTable);
         int joinTableId       = storageManager->getTableId(statement.joinTable);
@@ -844,6 +873,19 @@ QueryResult Executor::executeUpdate(const SqlStatement &statement)
                          ", got " + valueTypeName(newValue));
     }
 
+    std::string rowKey;
+    if (statement.where.enabled)
+    {
+        Value pkValue;
+        if (tryGetPrimaryKeyValue(tm, statement.where, pkValue))
+            rowKey = makeLockKey(pkValue);
+    }
+
+    if (!rowKey.empty())
+        storageManager->acquireWriteLock(statement.tableName, rowKey);
+    else
+        storageManager->acquireWriteLock(statement.tableName);
+
     int rowsAffected = 0;
     Table table = makeTableFromMetadata(tm, tableId);
 
@@ -899,6 +941,20 @@ QueryResult Executor::executeDelete(const SqlStatement &statement)
 
     TableMetadata tm = storageManager->getCatalog().getTable(statement.tableName);
     int tableId      = storageManager->getTableId(statement.tableName);
+
+    std::string rowKey;
+    if (statement.where.enabled)
+    {
+        Value pkValue;
+        if (tryGetPrimaryKeyValue(tm, statement.where, pkValue))
+            rowKey = makeLockKey(pkValue);
+    }
+
+    if (!rowKey.empty())
+        storageManager->acquireWriteLock(statement.tableName, rowKey);
+    else
+        storageManager->acquireWriteLock(statement.tableName);
+
     int rowsAffected = 0;
 
     if (statement.where.enabled)

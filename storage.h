@@ -6,6 +6,9 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <set>
+#include <unordered_map>
 #include "types.h"
 #include "kvstore.h"
 #include "index.h"
@@ -34,6 +37,10 @@ public:
     void rollbackTransaction();
     bool isInTransaction() const;
     
+    // Locking and isolation
+    void acquireReadLock(const std::string &tableName, const std::string &rowKey = "");
+    void acquireWriteLock(const std::string &tableName, const std::string &rowKey = "");
+
     // Data operations
     void insertRecord(int tableId, const std::string &tableName, const Record &record);
     void deleteRecord(int tableId, const Record &record);
@@ -59,11 +66,32 @@ private:
     bool inTransaction = false;
     std::vector<WalEntry> transactionLog;
     std::string transactionSnapshot;
-    
+    int nextTransactionId = 1;
+    int currentTransactionId = 0;
+
+    struct LockInfo
+    {
+        int transactionId;
+        bool exclusive;
+    };
+
+    struct TransactionLockState
+    {
+        std::set<std::string> resources;
+    };
+
+    std::mutex lockManagerMutex;
+    std::condition_variable lockManagerCv;
+    std::unordered_map<std::string, std::vector<LockInfo>> grantedLocks;
+    std::unordered_map<int, TransactionLockState> transactionLocks;
+
     void applyWalEntry(const WalEntry &entry);
     void clearDatabaseState();
     void deduplicatePrimaryKeys();
     void rebuildIndexesFromData();
+    void releaseTransactionLocksLocked(int transactionId);
+    void acquireLockLocked(const std::string &resourceId, bool exclusive);
+    std::string makeLockResource(const std::string &tableName, const std::string &rowKey = "") const;
     void indexRecord(const TableMetadata &tm, const Record &record);
     void unindexRecord(const TableMetadata &tm, const Record &record);
     std::string serializeDatabase();

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cctype>
 #include <set>
+#include <algorithm>
 
 namespace
 {
@@ -77,6 +78,7 @@ void StorageManager::beginTransaction()
         throw std::runtime_error("Transaction already in progress");
 
     inTransaction = true;
+    currentTransactionId = nextTransactionId++;
     transactionLog.clear();
     transactionSnapshot = serializeDatabase();
 }
@@ -97,7 +99,9 @@ void StorageManager::commitTransaction()
         applyWalEntry(entry);
 
     // Clear transaction state and persist a checkpoint.
+    releaseTransactionLocksLocked(currentTransactionId);
     inTransaction = false;
+    currentTransactionId = 0;
     transactionSnapshot.clear();
     // Checkpoint will clear the WAL once the snapshot is safely written.
     save();
@@ -115,10 +119,28 @@ void StorageManager::rollbackTransaction()
     deserializeDatabase(transactionSnapshot);
     rebuildIndexesFromData();
 
+    releaseTransactionLocksLocked(currentTransactionId);
     inTransaction = false;
+    currentTransactionId = 0;
     transactionLog.clear();
     transactionSnapshot.clear();
     // No save() here — we intentionally don't persist rolled-back data.
+}
+
+void StorageManager::acquireReadLock(const std::string &tableName, const std::string &rowKey)
+{
+    std::lock_guard<std::recursive_mutex> lock(storageMutex);
+    if (!inTransaction || currentTransactionId <= 0)
+        return;
+    acquireLockLocked(makeLockResource(tableName, rowKey), false);
+}
+
+void StorageManager::acquireWriteLock(const std::string &tableName, const std::string &rowKey)
+{
+    std::lock_guard<std::recursive_mutex> lock(storageMutex);
+    if (!inTransaction || currentTransactionId <= 0)
+        return;
+    acquireLockLocked(makeLockResource(tableName, rowKey), true);
 }
 
 void StorageManager::insertRecord(int tableId, const std::string &tableName, const Record &record)
@@ -383,6 +405,83 @@ void StorageManager::applyWalEntry(const WalEntry &entry)
     {
         std::cerr << "Error applying WAL entry: " << e.what() << std::endl;
     }
+}
+
+void StorageManager::releaseTransactionLocksLocked(int transactionId)
+{
+    if (transactionId <= 0)
+        return;
+
+    std::unique_lock<std::mutex> lock(lockManagerMutex);
+    auto it = transactionLocks.find(transactionId);
+    if (it == transactionLocks.end())
+        return;
+
+    for (const auto &resource : it->second.resources)
+    {
+        auto grantedIt = grantedLocks.find(resource);
+        if (grantedIt == grantedLocks.end())
+            continue;
+
+        auto &holders = grantedIt->second;
+        holders.erase(std::remove_if(holders.begin(), holders.end(),
+            [transactionId](const LockInfo &entry)
+            {
+                return entry.transactionId == transactionId;
+            }), holders.end());
+
+        if (holders.empty())
+            grantedLocks.erase(grantedIt);
+    }
+
+    transactionLocks.erase(it);
+    lockManagerCv.notify_all();
+}
+
+void StorageManager::acquireLockLocked(const std::string &resourceId, bool exclusive)
+{
+    std::unique_lock<std::mutex> lock(lockManagerMutex);
+
+    while (true)
+    {
+        bool conflict = false;
+        auto grantedIt = grantedLocks.find(resourceId);
+        if (grantedIt != grantedLocks.end())
+        {
+            for (const auto &holder : grantedIt->second)
+            {
+                if (holder.transactionId == currentTransactionId)
+                    continue;
+
+                if (exclusive || holder.exclusive)
+                {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+
+        if (!conflict)
+        {
+            auto &txLocks = transactionLocks[currentTransactionId];
+            if (txLocks.resources.find(resourceId) == txLocks.resources.end())
+            {
+                txLocks.resources.insert(resourceId);
+                grantedLocks[resourceId].push_back({currentTransactionId, exclusive});
+            }
+            return;
+        }
+
+        lockManagerCv.wait(lock);
+    }
+}
+
+std::string StorageManager::makeLockResource(const std::string &tableName, const std::string &rowKey) const
+{
+    std::string resource = "table:" + lowerCopy(tableName);
+    if (!rowKey.empty())
+        resource += ":row:" + rowKey;
+    return resource;
 }
 
 void StorageManager::clearDatabaseState()
