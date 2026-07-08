@@ -358,30 +358,26 @@ std::vector<std::string> Executor::listTables() const
 
 void Executor::shutdown()
 {
-    // Roll back any uncommitted transaction so we never checkpoint dirty data.
-    if (inTransaction)
-    {
-        try { storageManager->rollbackTransaction(); }
-        catch (...) {}
-        inTransaction = false;
-    }
+    try { storageManager->rollbackAllTransactions(); }
+    catch (...) {}
+    inTransaction = false;
     storageManager->save();
 }
 
-QueryResult Executor::execute(const SqlStatement &statement)
+QueryResult Executor::execute(const SqlStatement &statement, const std::string &sessionId)
 {
     try
     {
         switch (statement.type)
         {
-        case SqlStatementType::CreateTable: return executeCreateTable(statement);
-        case SqlStatementType::Insert:      return executeInsert(statement);
-        case SqlStatementType::Select:      return executeSelect(statement);
-        case SqlStatementType::Update:      return executeUpdate(statement);
-        case SqlStatementType::Delete:      return executeDelete(statement);
-        case SqlStatementType::Begin:       return executeBegin(statement);
-        case SqlStatementType::Commit:      return executeCommit(statement);
-        case SqlStatementType::Rollback:    return executeRollback(statement);
+        case SqlStatementType::CreateTable: return executeCreateTable(statement, sessionId);
+        case SqlStatementType::Insert:      return executeInsert(statement, sessionId);
+        case SqlStatementType::Select:      return executeSelect(statement, sessionId);
+        case SqlStatementType::Update:      return executeUpdate(statement, sessionId);
+        case SqlStatementType::Delete:      return executeDelete(statement, sessionId);
+        case SqlStatementType::Begin:       return executeBegin(statement, sessionId);
+        case SqlStatementType::Commit:      return executeCommit(statement, sessionId);
+        case SqlStatementType::Rollback:    return executeRollback(statement, sessionId);
         default:
         {
             QueryResult result;
@@ -400,7 +396,7 @@ QueryResult Executor::execute(const SqlStatement &statement)
     }
 }
 
-QueryResult Executor::executeCreateTable(const SqlStatement &statement)
+QueryResult Executor::executeCreateTable(const SqlStatement &statement, const std::string &sessionId)
 {
     if (statement.columns.empty())
         return makeError("CREATE TABLE requires at least one column");
@@ -436,7 +432,7 @@ QueryResult Executor::executeCreateTable(const SqlStatement &statement)
         columns[0].isNotNull    = true;
     }
 
-    storageManager->createTable(statement.tableName, columns);
+    storageManager->createTable(statement.tableName, columns, sessionId);
 
     QueryResult result;
     result.success     = true;
@@ -460,7 +456,7 @@ Record Executor::buildRecordFromValues(const TableMetadata &tm,
     return rec;
 }
 
-QueryResult Executor::executeInsert(const SqlStatement &statement)
+QueryResult Executor::executeInsert(const SqlStatement &statement, const std::string &sessionId)
 {
     if (!storageManager->getCatalog().tableExists(statement.tableName))
         return makeError("Table not found: " + statement.tableName);
@@ -523,10 +519,13 @@ QueryResult Executor::executeInsert(const SqlStatement &statement)
     if (pkIndex >= 0 && pkIndex < static_cast<int>(values.size()))
         rowKey = makeLockKey(values[pkIndex]);
 
-    storageManager->acquireWriteLock(statement.tableName, rowKey);
+    if (!rowKey.empty())
+        storageManager->acquireWriteLock(statement.tableName, rowKey, sessionId);
+    else
+        storageManager->acquireWriteLock(statement.tableName, "", sessionId);
 
     int tableId = storageManager->getTableId(statement.tableName);
-    storageManager->insertRecord(tableId, statement.tableName, rec);
+    storageManager->insertRecord(tableId, statement.tableName, rec, sessionId);
 
     QueryResult result;
     result.success     = true;
@@ -535,16 +534,17 @@ QueryResult Executor::executeInsert(const SqlStatement &statement)
     return result;
 }
 
-QueryResult Executor::executeBegin(const SqlStatement &statement)
+QueryResult Executor::executeBegin(const SqlStatement &statement, const std::string &sessionId)
 {
     (void)statement;
     QueryResult result;
     try
     {
-        storageManager->beginTransaction();
+        std::string activeSession = storageManager->beginTransaction(sessionId);
         inTransaction = true;
         result.success = true;
         result.message = "Transaction started";
+        result.sessionId = activeSession;
     }
     catch (const std::exception &ex)
     {
@@ -554,20 +554,20 @@ QueryResult Executor::executeBegin(const SqlStatement &statement)
     return result;
 }
 
-QueryResult Executor::executeCommit(const SqlStatement &statement)
+QueryResult Executor::executeCommit(const SqlStatement &statement, const std::string &sessionId)
 {
     (void)statement;
     QueryResult result;
     try
     {
-        if (!inTransaction)
+        if (!storageManager->hasActiveTransaction(sessionId))
         {
             result.success = false;
             result.message = "No transaction in progress";
             return result;
         }
 
-        storageManager->commitTransaction();
+        storageManager->commitTransaction(sessionId);
         inTransaction = false;
         result.success = true;
         result.message = "Transaction committed";
@@ -580,20 +580,20 @@ QueryResult Executor::executeCommit(const SqlStatement &statement)
     return result;
 }
 
-QueryResult Executor::executeRollback(const SqlStatement &statement)
+QueryResult Executor::executeRollback(const SqlStatement &statement, const std::string &sessionId)
 {
     (void)statement;
     QueryResult result;
     try
     {
-        if (!inTransaction)
+        if (!storageManager->hasActiveTransaction(sessionId))
         {
             result.success = false;
             result.message = "No transaction in progress";
             return result;
         }
 
-        storageManager->rollbackTransaction();
+        storageManager->rollbackTransaction(sessionId);
         inTransaction = false;
         result.success = true;
         result.message = "Transaction rolled back";
@@ -606,7 +606,7 @@ QueryResult Executor::executeRollback(const SqlStatement &statement)
     return result;
 }
 
-QueryResult Executor::executeSelect(const SqlStatement &statement)
+QueryResult Executor::executeSelect(const SqlStatement &statement, const std::string &sessionId)
 {
     if (!storageManager->getCatalog().tableExists(statement.tableName))
         return makeError("Table not found: " + statement.tableName);
@@ -685,9 +685,9 @@ QueryResult Executor::executeSelect(const SqlStatement &statement)
     }
 
     if (!rowKey.empty())
-        storageManager->acquireReadLock(statement.tableName, rowKey);
+        storageManager->acquireReadLock(statement.tableName, rowKey, sessionId);
     else
-        storageManager->acquireReadLock(statement.tableName);
+        storageManager->acquireReadLock(statement.tableName, "", sessionId);
 
     // ----------------------------------------------------------------
     // JOIN path: nested-loop inner join, then project from combined row
@@ -697,7 +697,7 @@ QueryResult Executor::executeSelect(const SqlStatement &statement)
         if (!storageManager->getCatalog().tableExists(statement.joinTable))
             return makeError("Table not found: " + statement.joinTable);
 
-        storageManager->acquireReadLock(statement.joinTable);
+        storageManager->acquireReadLock(statement.joinTable, "", sessionId);
 
         TableMetadata joinTm  = storageManager->getCatalog().getTable(statement.joinTable);
         int joinTableId       = storageManager->getTableId(statement.joinTable);
@@ -845,7 +845,7 @@ QueryResult Executor::executeSelect(const SqlStatement &statement)
     return result;
 }
 
-QueryResult Executor::executeUpdate(const SqlStatement &statement)
+QueryResult Executor::executeUpdate(const SqlStatement &statement, const std::string &sessionId)
 {
     if (!storageManager->getCatalog().tableExists(statement.tableName))
         return makeError("Table not found: " + statement.tableName);
@@ -882,9 +882,9 @@ QueryResult Executor::executeUpdate(const SqlStatement &statement)
     }
 
     if (!rowKey.empty())
-        storageManager->acquireWriteLock(statement.tableName, rowKey);
+        storageManager->acquireWriteLock(statement.tableName, rowKey, sessionId);
     else
-        storageManager->acquireWriteLock(statement.tableName);
+        storageManager->acquireWriteLock(statement.tableName, "", sessionId);
 
     int rowsAffected = 0;
     Table table = makeTableFromMetadata(tm, tableId);
@@ -902,7 +902,7 @@ QueryResult Executor::executeUpdate(const SqlStatement &statement)
             {
                 Record updated = rec;
                 updated.vals[targetColumn] = newValue;
-                storageManager->updateRecord(tableId, rec, updated);
+                storageManager->updateRecord(tableId, rec, updated, sessionId);
                 rowsAffected = 1;
             }
         }
@@ -922,7 +922,7 @@ QueryResult Executor::executeUpdate(const SqlStatement &statement)
 
             Record updated = rec;
             updated.vals[targetColumn] = newValue;
-            storageManager->updateRecord(tableId, rec, updated);
+            storageManager->updateRecord(tableId, rec, updated, sessionId);
             ++rowsAffected;
         }
     }
@@ -934,7 +934,7 @@ QueryResult Executor::executeUpdate(const SqlStatement &statement)
     return result;
 }
 
-QueryResult Executor::executeDelete(const SqlStatement &statement)
+QueryResult Executor::executeDelete(const SqlStatement &statement, const std::string &sessionId)
 {
     if (!storageManager->getCatalog().tableExists(statement.tableName))
         return makeError("Table not found: " + statement.tableName);
@@ -951,9 +951,9 @@ QueryResult Executor::executeDelete(const SqlStatement &statement)
     }
 
     if (!rowKey.empty())
-        storageManager->acquireWriteLock(statement.tableName, rowKey);
+        storageManager->acquireWriteLock(statement.tableName, rowKey, sessionId);
     else
-        storageManager->acquireWriteLock(statement.tableName);
+        storageManager->acquireWriteLock(statement.tableName, "", sessionId);
 
     int rowsAffected = 0;
 
@@ -972,7 +972,7 @@ QueryResult Executor::executeDelete(const SqlStatement &statement)
         if (!data.empty())
         {
             Record rec = deserialize(data);
-            storageManager->deleteRecord(tableId, rec);
+            storageManager->deleteRecord(tableId, rec, sessionId);
             rowsAffected = 1;
         }
     }
@@ -986,7 +986,7 @@ QueryResult Executor::executeDelete(const SqlStatement &statement)
             if (!matchesWhereClause(rec, tm, statement.where))
                 continue;
 
-            storageManager->deleteRecord(tableId, rec);
+            storageManager->deleteRecord(tableId, rec, sessionId);
             ++rowsAffected;
         }
     }

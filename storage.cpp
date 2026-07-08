@@ -49,6 +49,13 @@ namespace
         return true;
     }
 
+    std::string lockKeyForValue(const Value &value)
+    {
+        if (value.type == TYPE_INT)
+            return std::to_string(value.i);
+        return value.s;
+    }
+
     std::vector<char> recordKey(int tableId, const TableMetadata &tm, const Record &record)
     {
         Value pk;
@@ -65,85 +72,135 @@ StorageManager::StorageManager(const std::string &dataDir)
     load();
 }
 
-bool StorageManager::isInTransaction() const
+std::string StorageManager::normalizeSessionId(const std::string &sessionId) const
 {
-    std::lock_guard<std::recursive_mutex> lock(storageMutex);
-    return inTransaction;
+    if (!sessionId.empty())
+        return sessionId;
+    return "default";
 }
 
-void StorageManager::beginTransaction()
+StorageManager::TransactionContext &StorageManager::getOrCreateTransactionContext(const std::string &sessionId)
+{
+    std::string key = normalizeSessionId(sessionId);
+    return transactionContexts[key];
+}
+
+const StorageManager::TransactionContext *StorageManager::getTransactionContext(const std::string &sessionId) const
+{
+    std::string key = normalizeSessionId(sessionId);
+    auto it = transactionContexts.find(key);
+    if (it == transactionContexts.end())
+        return nullptr;
+    return &it->second;
+}
+
+bool StorageManager::isInTransaction(const std::string &sessionId) const
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
-    if (inTransaction)
+    const StorageManager::TransactionContext *ctx = getTransactionContext(sessionId);
+    return ctx != nullptr && ctx->inTransaction;
+}
+
+bool StorageManager::hasActiveTransaction(const std::string &sessionId) const
+{
+    return isInTransaction(sessionId);
+}
+
+std::string StorageManager::beginTransaction(const std::string &sessionId)
+{
+    std::lock_guard<std::recursive_mutex> lock(storageMutex);
+    std::string key = normalizeSessionId(sessionId);
+    StorageManager::TransactionContext &ctx = transactionContexts[key];
+    if (ctx.inTransaction)
         throw std::runtime_error("Transaction already in progress");
 
-    inTransaction = true;
-    currentTransactionId = nextTransactionId++;
-    transactionLog.clear();
-    transactionSnapshot = serializeDatabase();
+    ctx.inTransaction = true;
+    ctx.currentTransactionId = nextTransactionId.fetch_add(1, std::memory_order_relaxed);
+    ctx.transactionLog.clear();
+    ctx.transactionSnapshot = serializeDatabase();
+    return key;
 }
 
-void StorageManager::commitTransaction()
+void StorageManager::commitTransaction(const std::string &sessionId)
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
-    if (!inTransaction)
+    std::string key = normalizeSessionId(sessionId);
+    auto it = transactionContexts.find(key);
+    if (it == transactionContexts.end() || !it->second.inTransaction)
         throw std::runtime_error("No transaction in progress");
 
-    // Write all buffered entries to WAL before applying them to the in-memory store.
-    for (const auto &entry : transactionLog)
+    StorageManager::TransactionContext &ctx = it->second;
+    for (const auto &entry : ctx.transactionLog)
         wal->logOperation(entry);
 
-    // Now that WAL entries have been durably appended, apply them to the in-memory
-    // KV store so the committed state becomes visible.
-    for (const auto &entry : transactionLog)
+    for (const auto &entry : ctx.transactionLog)
         applyWalEntry(entry);
 
-    // Clear transaction state and persist a checkpoint.
-    releaseTransactionLocksLocked(currentTransactionId);
-    inTransaction = false;
-    currentTransactionId = 0;
-    transactionSnapshot.clear();
-    // Checkpoint will clear the WAL once the snapshot is safely written.
+    releaseTransactionLocksLocked(ctx.currentTransactionId);
+    ctx.inTransaction = false;
+    ctx.currentTransactionId = 0;
+    ctx.transactionSnapshot.clear();
     save();
-    transactionLog.clear();
+    ctx.transactionLog.clear();
 }
 
-void StorageManager::rollbackTransaction()
+void StorageManager::rollbackTransaction(const std::string &sessionId)
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
-    if (!inTransaction)
+    std::string key = normalizeSessionId(sessionId);
+    auto it = transactionContexts.find(key);
+    if (it == transactionContexts.end() || !it->second.inTransaction)
         throw std::runtime_error("No transaction in progress");
 
-    // Restore the pre-transaction snapshot.
+    StorageManager::TransactionContext &ctx = it->second;
     clearDatabaseState();
-    deserializeDatabase(transactionSnapshot);
+    deserializeDatabase(ctx.transactionSnapshot);
     rebuildIndexesFromData();
 
-    releaseTransactionLocksLocked(currentTransactionId);
-    inTransaction = false;
-    currentTransactionId = 0;
-    transactionLog.clear();
-    transactionSnapshot.clear();
-    // No save() here — we intentionally don't persist rolled-back data.
+    releaseTransactionLocksLocked(ctx.currentTransactionId);
+    ctx.inTransaction = false;
+    ctx.currentTransactionId = 0;
+    ctx.transactionLog.clear();
+    ctx.transactionSnapshot.clear();
 }
 
-void StorageManager::acquireReadLock(const std::string &tableName, const std::string &rowKey)
+void StorageManager::rollbackAllTransactions()
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
-    if (!inTransaction || currentTransactionId <= 0)
-        return;
-    acquireLockLocked(makeLockResource(tableName, rowKey), false);
+    for (auto &entry : transactionContexts)
+    {
+        if (!entry.second.inTransaction)
+            continue;
+        clearDatabaseState();
+        deserializeDatabase(entry.second.transactionSnapshot);
+        rebuildIndexesFromData();
+        releaseTransactionLocksLocked(entry.second.currentTransactionId);
+        entry.second.inTransaction = false;
+        entry.second.currentTransactionId = 0;
+        entry.second.transactionLog.clear();
+        entry.second.transactionSnapshot.clear();
+    }
 }
 
-void StorageManager::acquireWriteLock(const std::string &tableName, const std::string &rowKey)
+void StorageManager::acquireReadLock(const std::string &tableName, const std::string &rowKey, const std::string &sessionId)
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
-    if (!inTransaction || currentTransactionId <= 0)
+    auto it = transactionContexts.find(normalizeSessionId(sessionId));
+    if (it == transactionContexts.end() || !it->second.inTransaction || it->second.currentTransactionId <= 0)
         return;
-    acquireLockLocked(makeLockResource(tableName, rowKey), true);
+    acquireLockLocked(makeLockResource(tableName, rowKey), false, sessionId);
 }
 
-void StorageManager::insertRecord(int tableId, const std::string &tableName, const Record &record)
+void StorageManager::acquireWriteLock(const std::string &tableName, const std::string &rowKey, const std::string &sessionId)
+{
+    std::lock_guard<std::recursive_mutex> lock(storageMutex);
+    auto it = transactionContexts.find(normalizeSessionId(sessionId));
+    if (it == transactionContexts.end() || !it->second.inTransaction || it->second.currentTransactionId <= 0)
+        return;
+    acquireLockLocked(makeLockResource(tableName, rowKey), true, sessionId);
+}
+
+void StorageManager::insertRecord(int tableId, const std::string &tableName, const Record &record, const std::string &sessionId)
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
     std::string normalizedTableName = lowerCopy(tableName);
@@ -164,22 +221,27 @@ void StorageManager::insertRecord(int tableId, const std::string &tableName, con
         throw std::runtime_error("Invalid primary key value");
 
     std::vector<char> key = encodeKey(effectiveTableId, {record.vals[pkIndex]});
+    Value pkValue = record.vals[pkIndex];
+    acquireLockLocked(makeLockResource(normalizedTableName, lockKeyForValue(pkValue)), true, sessionId);
 
-    // Duplicate PK check in the committed store.
     if (!kvStore.get(key).empty())
         throw std::runtime_error("Duplicate primary key value");
 
-    // Duplicate PK check within an in-progress transaction buffer.
-    for (const auto &pending : transactionLog)
+    auto ctxIt = transactionContexts.find(normalizeSessionId(sessionId));
+    const bool inActiveTransaction = ctxIt != transactionContexts.end() && ctxIt->second.inTransaction;
+    if (inActiveTransaction)
     {
-        if (pending.operation != WalOperationType::Insert)
-            continue;
-        if (pending.tableId != effectiveTableId)
-            continue;
-        if (pending.newRecord.vals.size() <= static_cast<size_t>(pkIndex))
-            continue;
-        if (encodeKey(effectiveTableId, {pending.newRecord.vals[pkIndex]}) == key)
-            throw std::runtime_error("Duplicate primary key value");
+        for (const auto &pending : ctxIt->second.transactionLog)
+        {
+            if (pending.operation != WalOperationType::Insert)
+                continue;
+            if (pending.tableId != effectiveTableId)
+                continue;
+            if (pending.newRecord.vals.size() <= static_cast<size_t>(pkIndex))
+                continue;
+            if (encodeKey(effectiveTableId, {pending.newRecord.vals[pkIndex]}) == key)
+                throw std::runtime_error("Duplicate primary key value");
+        }
     }
 
     WalEntry entry;
@@ -191,9 +253,9 @@ void StorageManager::insertRecord(int tableId, const std::string &tableName, con
     entry.value      = serialize(record);
     entry.newRecord  = record;
 
-    if (inTransaction)
+    if (inActiveTransaction)
     {
-        transactionLog.push_back(entry);
+        ctxIt->second.transactionLog.push_back(entry);
     }
     else
     {
@@ -203,7 +265,7 @@ void StorageManager::insertRecord(int tableId, const std::string &tableName, con
     }
 }
 
-void StorageManager::deleteRecord(int tableId, const Record &record)
+void StorageManager::deleteRecord(int tableId, const Record &record, const std::string &sessionId)
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
 
@@ -222,11 +284,20 @@ void StorageManager::deleteRecord(int tableId, const Record &record)
         entry.key   = recordKey(tableId, tm, record);
         entry.value = serialize(record);
     }
+
+    if (!entry.key.empty())
+    {
+        Value pkValue;
+        if (primaryKeyValue(catalog.getTable(entry.tableName), record, pkValue))
+            acquireLockLocked(makeLockResource(entry.tableName, lockKeyForValue(pkValue)), true, sessionId);
+    }
     entry.oldRecord = record;
 
-    if (inTransaction)
+    auto ctxIt = transactionContexts.find(normalizeSessionId(sessionId));
+    const bool inActiveTransaction = ctxIt != transactionContexts.end() && ctxIt->second.inTransaction;
+    if (inActiveTransaction)
     {
-        transactionLog.push_back(entry);
+        ctxIt->second.transactionLog.push_back(entry);
     }
     else
     {
@@ -236,7 +307,7 @@ void StorageManager::deleteRecord(int tableId, const Record &record)
     }
 }
 
-void StorageManager::updateRecord(int tableId, const Record &oldRecord, const Record &newRecord)
+void StorageManager::updateRecord(int tableId, const Record &oldRecord, const Record &newRecord, const std::string &sessionId)
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
 
@@ -255,12 +326,21 @@ void StorageManager::updateRecord(int tableId, const Record &oldRecord, const Re
         entry.key   = recordKey(tableId, tm, oldRecord);
         entry.value = serialize(newRecord);
     }
+
+    if (!entry.key.empty())
+    {
+        Value pkValue;
+        if (primaryKeyValue(catalog.getTable(entry.tableName), oldRecord, pkValue))
+            acquireLockLocked(makeLockResource(entry.tableName, lockKeyForValue(pkValue)), true, sessionId);
+    }
     entry.oldRecord = oldRecord;
     entry.newRecord = newRecord;
 
-    if (inTransaction)
+    auto ctxIt = transactionContexts.find(normalizeSessionId(sessionId));
+    const bool inActiveTransaction = ctxIt != transactionContexts.end() && ctxIt->second.inTransaction;
+    if (inActiveTransaction)
     {
-        transactionLog.push_back(entry);
+        ctxIt->second.transactionLog.push_back(entry);
     }
     else
     {
@@ -270,7 +350,7 @@ void StorageManager::updateRecord(int tableId, const Record &oldRecord, const Re
     }
 }
 
-void StorageManager::createTable(const std::string &tableName, const std::vector<ColumnMetadata> &columns)
+void StorageManager::createTable(const std::string &tableName, const std::vector<ColumnMetadata> &columns, const std::string &sessionId)
 {
     std::lock_guard<std::recursive_mutex> lock(storageMutex);
     std::string normalizedTableName = lowerCopy(tableName);
@@ -285,9 +365,11 @@ void StorageManager::createTable(const std::string &tableName, const std::vector
     entry.tableName = normalizedTableName;
     entry.columns   = columns;
 
-    if (inTransaction)
+    auto ctxIt = transactionContexts.find(normalizeSessionId(sessionId));
+    const bool inActiveTransaction = ctxIt != transactionContexts.end() && ctxIt->second.inTransaction;
+    if (inActiveTransaction)
     {
-        transactionLog.push_back(entry);
+        ctxIt->second.transactionLog.push_back(entry);
     }
     else
     {
@@ -409,71 +491,22 @@ void StorageManager::applyWalEntry(const WalEntry &entry)
 
 void StorageManager::releaseTransactionLocksLocked(int transactionId)
 {
-    if (transactionId <= 0)
-        return;
-
-    std::unique_lock<std::mutex> lock(lockManagerMutex);
-    auto it = transactionLocks.find(transactionId);
-    if (it == transactionLocks.end())
-        return;
-
-    for (const auto &resource : it->second.resources)
-    {
-        auto grantedIt = grantedLocks.find(resource);
-        if (grantedIt == grantedLocks.end())
-            continue;
-
-        auto &holders = grantedIt->second;
-        holders.erase(std::remove_if(holders.begin(), holders.end(),
-            [transactionId](const LockInfo &entry)
-            {
-                return entry.transactionId == transactionId;
-            }), holders.end());
-
-        if (holders.empty())
-            grantedLocks.erase(grantedIt);
-    }
-
-    transactionLocks.erase(it);
-    lockManagerCv.notify_all();
+    lockManager.releaseAllLocks(transactionId);
 }
 
-void StorageManager::acquireLockLocked(const std::string &resourceId, bool exclusive)
+void StorageManager::acquireLockLocked(const std::string &resourceId, bool exclusive, const std::string &sessionId)
 {
-    std::unique_lock<std::mutex> lock(lockManagerMutex);
+    auto it = transactionContexts.find(normalizeSessionId(sessionId));
+    if (it == transactionContexts.end() || !it->second.inTransaction || it->second.currentTransactionId <= 0)
+        return;
 
-    while (true)
-    {
-        bool conflict = false;
-        auto grantedIt = grantedLocks.find(resourceId);
-        if (grantedIt != grantedLocks.end())
-        {
-            for (const auto &holder : grantedIt->second)
-            {
-                if (holder.transactionId == currentTransactionId)
-                    continue;
+    bool acquired = lockManager.acquireLock(
+        it->second.currentTransactionId,
+        resourceId,
+        exclusive ? LockManager::LockMode::Exclusive : LockManager::LockMode::Shared);
 
-                if (exclusive || holder.exclusive)
-                {
-                    conflict = true;
-                    break;
-                }
-            }
-        }
-
-        if (!conflict)
-        {
-            auto &txLocks = transactionLocks[currentTransactionId];
-            if (txLocks.resources.find(resourceId) == txLocks.resources.end())
-            {
-                txLocks.resources.insert(resourceId);
-                grantedLocks[resourceId].push_back({currentTransactionId, exclusive});
-            }
-            return;
-        }
-
-        lockManagerCv.wait(lock);
-    }
+    if (!acquired)
+        throw std::runtime_error("Timed out waiting for lock on resource");
 }
 
 std::string StorageManager::makeLockResource(const std::string &tableName, const std::string &rowKey) const

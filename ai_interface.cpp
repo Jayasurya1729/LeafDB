@@ -378,10 +378,10 @@ std::string AIInterface::getSchemaContext() const
     return schemaTools.execute({"get_schema", {}}).result;
 }
 
-QueryResult AIInterface::executeSqlStatement(const std::string &query) const
+QueryResult AIInterface::executeSqlStatement(const std::string &query, const std::string &sessionId) const
 {
     SqlStatement statement = parseSql(query);
-    return executor.execute(statement);
+    return executor.execute(statement, sessionId);
 }
 
 std::vector<std::string> AIInterface::listTables() const

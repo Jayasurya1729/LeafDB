@@ -10,6 +10,22 @@
 #include <iostream>
 #include <sstream>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <algorithm> 
+
+namespace
+{
+    std::atomic<uint64_t> g_sessionCounter{1};
+
+    std::string generateSessionId()
+    {
+        std::ostringstream oss;
+        oss << "sess-" << g_sessionCounter.fetch_add(1, std::memory_order_relaxed);
+        return oss.str();
+    }
+}
 
 WebUI::WebUI(AIInterface &ai, int port)
     : ai(ai), portNumber(port), running(false), serverSocket(-1)
@@ -93,8 +109,10 @@ void WebUI::runServer()
             continue;
         }
 
-        handleClient(client);
-        close(client);
+        std::thread([this, client]() {
+            handleClient(client);
+            close(client);
+        }).detach();
     }
 }
 
@@ -189,11 +207,26 @@ std::string WebUI::handleQueryRequest(const std::string &body)
     if (query.empty())
         return "{\"success\":false,\"error\":\"Missing query\"}";
 
+    std::string sessionId = extractJsonStringValue(body, "sessionId");
+    if (sessionId.empty())
+        sessionId = extractJsonStringValue(body, "session_id");
+
+    if (sessionId.empty())
+    {
+        std::string lower = query;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (lower.rfind("begin", 0) == 0)
+            sessionId = generateSessionId();
+    }
+
     try
     {
-        QueryResult result = ai.executeSqlStatement(query);
-        std::ostringstream json;
-        json << "{\"success\":true,\"message\":\"" << escapeJsonString(result.message) << "\"";
+        QueryResult result = ai.executeSqlStatement(query, sessionId);
+std::ostringstream json;
+json << "{\"success\":" << (result.success ? "true" : "false")
+     << ",\"message\":\"" << escapeJsonString(result.message) << "\"";
+        if (!result.sessionId.empty())
+            json << ",\"sessionId\":\"" << escapeJsonString(result.sessionId) << "\"";
         if (!result.columns.empty())
         {
             json << ",\"columns\":[";

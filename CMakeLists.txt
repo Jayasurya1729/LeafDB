@@ -13,6 +13,7 @@ add_executable(coredb
     wal.cpp
     kvstore.cpp
     btree.cpp
+    lock_manager.cpp
     table.cpp
     record.cpp
     encode.cpp

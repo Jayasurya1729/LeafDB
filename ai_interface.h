@@ -20,7 +20,7 @@ public:
     std::string processUserInput(const std::string &input);
     std::string getSchemaContext() const;
     std::vector<std::string> listTables() const;
-    QueryResult executeSqlStatement(const std::string &query) const;
+    QueryResult executeSqlStatement(const std::string &query, const std::string &sessionId = "") const;
 
     // Ask the configured LLM for a natural language response using schema context.
     std::string askLLM(const std::string &userPrompt);
